@@ -53,7 +53,7 @@ class tf1_fr(BaseService):
         return str(major * 1000000 + minor * 1000 + patch)
 
     @staticmethod
-   """
+    """
     def get_tf1_info():
         response = requests.get(tf1_fr.BASE_URL).content.decode().replace('\\"', '"')
         api_key = re.findall(r'"apiKey":"([^"]+)"', response)[0]
@@ -63,7 +63,7 @@ class tf1_fr(BaseService):
             rf'"playerEndpoint":"{tf1_fr.PLAYER_URL}/","version":"([^"]+)"', response
         )[0]
         return api_key, consent_ids, tf1_fr.format_version(player_version)
-    """
+     """
     @staticmethod
     def get_tf1_info():
         response = requests.get(tf1_fr.BASE_URL, timeout=30)
