@@ -53,6 +53,7 @@ class tf1_fr(BaseService):
         return str(major * 1000000 + minor * 1000 + patch)
 
     @staticmethod
+   """
     def get_tf1_info():
         response = requests.get(tf1_fr.BASE_URL).content.decode().replace('\\"', '"')
         api_key = re.findall(r'"apiKey":"([^"]+)"', response)[0]
@@ -62,6 +63,33 @@ class tf1_fr(BaseService):
             rf'"playerEndpoint":"{tf1_fr.PLAYER_URL}/","version":"([^"]+)"', response
         )[0]
         return api_key, consent_ids, tf1_fr.format_version(player_version)
+    """
+    @staticmethod
+    def get_tf1_info():
+        response = requests.get(tf1_fr.BASE_URL, timeout=30)
+        response.raise_for_status()
+        html = response.text.replace('\\"', '"')
+    
+        def extract(pattern, name):
+            match = re.search(pattern, html)
+            if not match:
+                raise ValueError(f"TF1: unable to find {name}")
+            return match.group(1)
+    
+        api_key = extract(r'"apiKey"\s*:\s*"([^"]+)"', "apiKey")
+        consent_ids = extract(
+            r'"neededConsentIds"\s*:\s*\[(.*?)]', "consent IDs"
+        ).replace('"', '').split(',')
+    
+        version = re.search(
+            rf'"playerEndpoint":"{re.escape(tf1_fr.PLAYER_URL)}/","version":"([^"]+)"',
+            html
+        ) or re.search(r'player_version=([0-9]+(?:\.[0-9]+)*)', html)
+    
+        if not version:
+            raise ValueError("TF1: player version not found; website format may have changed")
+    
+        return api_key, consent_ids, tf1_fr.format_version(version.group(1))
 
     @staticmethod
     def get_bearer_token():
