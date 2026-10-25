@@ -52,8 +52,8 @@ class tf1_fr(BaseService):
         major, minor, patch = map(int, version.split('.'))
         return str(major * 1000000 + minor * 1000 + patch)
 
-    @staticmethod
     """
+    @staticmethod
     def get_tf1_info():
         response = requests.get(tf1_fr.BASE_URL).content.decode().replace('\\"', '"')
         api_key = re.findall(r'"apiKey":"([^"]+)"', response)[0]
