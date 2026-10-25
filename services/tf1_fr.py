@@ -78,7 +78,7 @@ class tf1_fr(BaseService):
     
         api_key = extract(r'"apiKey"\s*:\s*"([^"]+)"', "apiKey")
         consent_ids = extract(
-            r'"neededConsentIds"\s*:\s*\[(.*?)]', "consent IDs"
+            r'"neededConsentIds"\s*:\s*\[(.*?)\]', "consent IDs"
         ).replace('"', '').split(',')
     
         version = re.search(
