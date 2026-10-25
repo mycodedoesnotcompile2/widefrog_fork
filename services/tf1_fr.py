@@ -52,18 +52,6 @@ class tf1_fr(BaseService):
         major, minor, patch = map(int, version.split('.'))
         return str(major * 1000000 + minor * 1000 + patch)
 
-    """
-    @staticmethod
-    def get_tf1_info():
-        response = requests.get(tf1_fr.BASE_URL).content.decode().replace('\\"', '"')
-        api_key = re.findall(r'"apiKey":"([^"]+)"', response)[0]
-        consent_ids = re.findall(r'neededConsentIds":\[(.*?)]', response)[0].replace("\"", "").split(",")
-
-        player_version = re.findall(
-            rf'"playerEndpoint":"{tf1_fr.PLAYER_URL}/","version":"([^"]+)"', response
-        )[0]
-        return api_key, consent_ids, tf1_fr.format_version(player_version)
-     """
     @staticmethod
     def get_tf1_info():
         response = requests.get(tf1_fr.BASE_URL, timeout=30)
@@ -78,7 +66,7 @@ class tf1_fr(BaseService):
     
         api_key = extract(r'"apiKey"\s*:\s*"([^"]+)"', "apiKey")
         consent_ids = extract(
-            r'"neededConsentIds"\s*:\s*\[(.*?)\]', "consent IDs"
+            r'"neededConsentIds"\s*:\s*\[(.*?)]', "consent IDs"
         ).replace('"', '').split(',')
     
         version = re.search(
