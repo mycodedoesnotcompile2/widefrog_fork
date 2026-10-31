@@ -1,4 +1,3 @@
-
 import builtins
 import json
 import re
@@ -36,7 +35,7 @@ class tf1_fr(BaseService):
     PASSWORD = "YOUR_PASSWORD"
     BEARER_TOKEN = None
     API_KEY = CONSENT_IDS = PLAYER_VERSION = None
-    USER_AGENT = builtins.CONFIG["USER_AGENT"]
+    USER_AGENT = None
 
     @staticmethod
     def test_service():
@@ -102,6 +101,7 @@ class tf1_fr(BaseService):
 
     @staticmethod
     def initialize_service():
+        USER_AGENT = builtins.CONFIG["USER_AGENT"]
         if any(value is None for value in (tf1_fr.API_KEY, tf1_fr.CONSENT_IDS, tf1_fr.PLAYER_VERSION)):
             tf1_fr.API_KEY, tf1_fr.CONSENT_IDS, tf1_fr.PLAYER_VERSION = tf1_fr.get_tf1_info()
 
