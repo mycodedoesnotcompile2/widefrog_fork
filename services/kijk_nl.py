@@ -3,7 +3,7 @@ import builtins
 import json
 import re
 from os.path import join
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
@@ -27,12 +27,27 @@ class kijk_nl(BaseService):
         "https://www.kijk.nl/programmas/vrienden-van-lingo/krnoeBgBKQrCbl",
     ]
 
-    GRAPHQL_URL = None
+    # Kijk.nl's GraphQL backend has moved to this Talpa endpoint.
+    GRAPHQL_URL = "https://api.prd.video.talpa.network/graphql"
     BASE_URL = "https://www.kijk.nl"
 
     DRM_TOKEN = None
     MAN_PRIORITY = {"": 0, "m3u8": 1, "ism": 2, "dash": 3}
     PAGE_SIZE = 50
+
+    # Headers that mimic a real browser request to both the Talpa API
+    # and the VUDRM license proxy (CORS checks require Origin/Referer).
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:159.0) "
+            "Gecko/20100101 Firefox/159.0"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "nl",
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Referer": "https://www.kijk.nl/",
+        "Origin": "https://www.kijk.nl",
+    }
 
     @staticmethod
     def test_service():
@@ -44,14 +59,36 @@ class kijk_nl(BaseService):
 
     @staticmethod
     def get_site_info():
-        graphql_url = json.loads(re.findall(
-            r'type="application/json"[^<>]*>({.*?})</script>',
-            requests.get(kijk_nl.BASE_URL).content.decode()
-        )[0])["props"]["pageProps"]["videoApiUrl"]
+        graphql_url = kijk_nl.GRAPHQL_URL
 
-        drm_token = json.loads(requests.get(
-            graphql_url, params={'query': '{ drmToken { token } }'}
-        ).content.decode())["data"]["drmToken"]["token"]
+        # Fetch a JWT for the VUDRM proxy. The provider must be "JWP";
+        # without it the response has a null drmToken.
+        token_payload = {
+            "query": (
+                "query DrmTokenQuery($provider: DrmProvider) {\n"
+                "  drmToken(drmProvider: $provider) {\n"
+                "    expiration\n"
+                "    token\n"
+                "  }\n"
+                "}"
+            ),
+            "variables": {"provider": "JWP"},
+        }
+        token_resp = requests.post(
+            graphql_url, headers=kijk_nl.HEADERS, json=token_payload
+        )
+        token_resp.raise_for_status()
+
+        data = token_resp.json().get("data", {}).get("drmToken") or {}
+        drm_token = data.get("token")
+        if not drm_token:
+            raise CustomException(ERR_MSG.format(
+                type=APP_ERROR,
+                url=graphql_url,
+                reason="drmToken endpoint returned no token",
+                solution=f"Update the {kijk_nl.__name__} service",
+            ))
+
         return graphql_url, drm_token
 
     @staticmethod
@@ -62,15 +99,29 @@ class kijk_nl(BaseService):
 
     @staticmethod
     def get_keys(challenge, additional):
+        # VUDRM's /proxy endpoint expects:
+        #   - Header X-VUDRM-TOKEN: <JWT from DrmTokenQuery>
+        #   - Content-Type: application/octet-stream
+        #   - Body: the *raw* Widevine challenge (not base64, not JSON)
+        #   - The release id as a query parameter (contentId)
+        license_url = additional["license_url"]
+        release_pid = additional.get("release_pid") or ""
+        if release_pid:
+            sep = "&" if "?" in license_url else "?"
+            license_url = f"{license_url}{sep}contentId={release_pid}"
+
         licence = requests.post(
-            additional["license_url"],
-            headers={'authorization': f'Basic {kijk_nl.DRM_TOKEN}'},
-            json={
-                'getRawWidevineLicense': {
-                    'releasePid': additional["release_pid"],
-                    'widevineChallenge': base64.b64encode(challenge).decode()
-                }
-            }
+            license_url,
+            headers={
+                "User-Agent": kijk_nl.HEADERS["User-Agent"],
+                "Accept": "*/*",
+                "Accept-Language": "nl",
+                "Origin": "https://www.kijk.nl",
+                "Referer": "https://www.kijk.nl/",
+                "Content-Type": "application/octet-stream",
+                "X-VUDRM-TOKEN": kijk_nl.DRM_TOKEN,
+            },
+            data=challenge,
         )
         licence.raise_for_status()
         return licence.content
@@ -80,10 +131,14 @@ class kijk_nl(BaseService):
         guid = source_element.url.split("/")[-1]
         page_dict = json.loads(re.findall(
             r'type="application/json"[^<>]*>({.*?})</script>',
-            requests.get(source_element.url).content.decode()
+            requests.get(source_element.url).content.decode(),
         )[0]).get("props", {})
 
-        response = page_dict.get("pageProps", {}).get("formatDataInitial", {}).get("video", {})
+        response = (
+            page_dict.get("pageProps", {})
+            .get("formatDataInitial", {})
+            .get("video", {})
+        )
         if response.get("guid", None) != guid:
             response = page_dict.get("apolloState", {})
 
@@ -107,7 +162,7 @@ class kijk_nl(BaseService):
         if source_element.collection is None:
             source_element.collection = join(
                 str(builtins.CONFIG["DOWNLOAD_COMMANDS"]["OUTPUT_MEDIA_PATH"]),
-                kijk_nl.__name__
+                kijk_nl.__name__,
             )
 
         subtitles = []
@@ -123,74 +178,95 @@ class kijk_nl(BaseService):
             srt_ext = get_ext_from_url(srt_url)
             srt_code = get_valid_filename(track["label"].lower())
 
-            subtitles.append((False, BaseElement(
-                url=srt_url,
-                collection=output_path,
-                element=f'subtitle_{index}_{srt_code}{srt_ext}'
-            )))
+            subtitles.append(
+                (
+                    False,
+                    BaseElement(
+                        url=srt_url,
+                        collection=output_path,
+                        element=f"subtitle_{index}_{srt_code}{srt_ext}",
+                    ),
+                )
+            )
 
         additional = {"SUBTITLES": subtitles}
-        response = json.loads(requests.get(
-            kijk_nl.GRAPHQL_URL,
-            params={
-                'operationName': 'sources', 'variables': json.dumps({"guid": guid}),
-                'query': '''
-                    query sources($guid:[String]) {
-                        programs(guid:$guid) { items { guid sources { type file drm } } }
-                    }
-                '''
-            }
-        ).content.decode())["data"]["programs"]["items"]
 
+        # Sources query — POST instead of GET to match the new endpoint.
+        sources_payload = {
+            "operationName": "sources",
+            "variables": {"guid": guid},
+            "query": """
+                query sources($guid:[String]) {
+                    programs(guid:$guid) { items { guid sources { type file drm } } }
+                }
+            """,
+        }
+        sources_resp = requests.post(
+            kijk_nl.GRAPHQL_URL, headers=kijk_nl.HEADERS, json=sources_payload
+        )
+        sources_resp.raise_for_status()
+
+        response = sources_resp.json()["data"]["programs"]["items"]
         response = [r["sources"] for r in response if r["guid"] == guid]
         response = flatten_list(response)
+
         if len(response) == 0:
             raise CustomException(ERR_MSG.format(
-                type=f'{USER_ERROR}',
+                type=f"{USER_ERROR}",
                 url=source_element.url,
                 reason="The content isn't available",
-                solution="Do not attempt to download it"
+                solution="Do not attempt to download it",
             ))
 
         response = list(filter(
             lambda r: len(parse_qs(urlparse(r["file"]).query).keys()) > 0,
-            response
+            response,
         ))
         if len(response) == 0:
             raise CustomException(ERR_MSG.format(
-                type=f'{USER_ERROR}',
+                type=f"{USER_ERROR}",
                 url=source_element.url,
                 reason="Need Dutch IP to access content",
-                solution="Use a VPN"
+                solution="Use a VPN",
             ))
 
-        response = list(filter(
-            lambda r: r.get("drm", {}) in [None, {}], response
-        )) + list(filter(
-            lambda r: len(list(filter(
-                lambda d: "widevine" in d.lower(),
-                list(r["drm"].keys())
-            ))) > 0,
-            list(filter(lambda r: r.get("drm", {}) not in [None, {}], response))
-        ))
+        response = (
+            list(filter(lambda r: r.get("drm", {}) in [None, {}], response))
+            + list(filter(
+                lambda r: len(list(filter(
+                    lambda d: "widevine" in d.lower(),
+                    list(r["drm"].keys()),
+                ))) > 0,
+                list(filter(
+                    lambda r: r.get("drm", {}) not in [None, {}], response
+                )),
+            ))
+        )
         if len(response) == 0:
             raise CustomException(ERR_MSG.format(
                 type=USER_ERROR,
                 url=source_element.url,
-                reason=f"DRM not supported. Widevine wasn't found",
-                solution="Do not attempt to download it"
+                reason="DRM not supported. Widevine wasn't found",
+                solution="Do not attempt to download it",
             ))
 
         response = sorted(
-            response, reverse=True,
-            key=lambda r: kijk_nl.MAN_PRIORITY.get(r["type"].lower(), "")
+            response,
+            reverse=True,
+            key=lambda r: kijk_nl.MAN_PRIORITY.get(r["type"].lower(), ""),
         )
-        if response[0]["type"].lower() not in ["dash", "ism"] and response[0].get("drm", {}) not in [{}, None]:
+        if (
+            response[0]["type"].lower() not in ["dash", "ism"]
+            and response[0].get("drm", {}) not in [{}, None]
+        ):
             raise CustomException(ERR_MSG.format(
                 type=APP_ERROR,
                 url=source_element.url,
-                reason=f"Manifest format not supported: {str(response)}. Can't extract pssh",
-                solution=f"Extend the {kijk_nl.__name__} service"
+                reason=(
+                    f"Manifest format not supported: {str(response)}. "
+                    f"Can't extract pssh"
+                ),
+                solution=f"Extend the {kijk_nl.__name__} service",
             ))
 
         response = response[0]
@@ -204,14 +280,44 @@ class kijk_nl(BaseService):
                     additional["release_pid"] = v["releasePid"]
                     break
 
-            pssh_value = str(min(re.findall(
-                r'<cenc:pssh\b[^>]*>(.*?)</cenc:pssh>',
-                requests.get(manifest).content.decode()
-            ), key=len))
-        except:
+            pssh_value = str(min(
+                re.findall(
+                    r"<cenc:pssh\b[^>]*>(.*?)</cenc:pssh>",
+                    requests.get(manifest).content.decode(),
+                ),
+                key=len,
+            ))
+        except Exception:
             pssh_value = None
 
         return manifest, pssh_value, additional
+
+    @staticmethod
+    def _get_content_api_items(endpoint):
+        items = []
+        skip = 0
+
+        while True:
+            response = requests.get(
+                endpoint,
+                headers=kijk_nl.HEADERS,
+                params={"skip": skip, "limit": kijk_nl.PAGE_SIZE},
+            )
+            response.raise_for_status()
+            data = response.json()["data"]
+            page_items = data.get("items", [])
+            items.extend(page_items)
+
+            skip += len(page_items)
+            if skip >= data["total"]:
+                return items
+            if len(page_items) == 0:
+                raise CustomException(ERR_MSG.format(
+                    type=APP_ERROR,
+                    url=endpoint,
+                    reason="The content API returned an incomplete result",
+                    solution=f"Debug the {kijk_nl.__name__} service",
+                ))
 
     @staticmethod
     def get_collection_elements(collection_url):
@@ -223,18 +329,156 @@ class kijk_nl(BaseService):
             return None
 
         slug = collection_url.split("/")[-1]
-        response = json.loads(re.findall(
-            r'type="application/json"[^<>]*>({.*?})</script>',
-            requests.get(collection_url).content.decode()
-        )[0]).get("props", {}).get("pageProps", {}).get("formatDataInitial", {}).get("format", {})
+        page_html = requests.get(collection_url).content.decode()
+        page_props = None
+        for script in re.findall(
+            r'type="application/json"[^<>]*>({.*?})</script>', page_html
+        ):
+            try:
+                page_data = json.loads(script)
+            except json.JSONDecodeError:
+                continue
+            page_props = page_data.get("props", {}).get("pageProps")
+            if page_props is not None:
+                break
+
+        current_series = (
+            page_props.get("initialSeries")
+            if isinstance(page_props, dict)
+            else None
+        )
+        if isinstance(current_series, dict):
+            if slug != current_series.get("slug", ""):
+                return []
+
+            collection_name = get_valid_filename(
+                current_series.get("title", slug)
+            )
+            collection_name = join(
+                join(
+                    str(builtins.CONFIG["DOWNLOAD_COMMANDS"]["OUTPUT_MEDIA_PATH"]),
+                    kijk_nl.__name__,
+                ),
+                collection_name,
+            )
+
+            season_numbers = {
+                int(season["seasonNumber"])
+                for season in page_props.get("initialSeasons", [])
+                if season.get("seasonNumber") is not None
+            }
+
+            episodes = kijk_nl._get_content_api_items(
+                current_series["episodesEndpoint"]
+            )
+            collection = []
+            episode_indexes = {}
+
+            for episode in episodes:
+                subtitle = episode.get("subtitle", "")
+                season_match = re.search(
+                    r"(?:seizoen|season)\s*(\d+)", subtitle, re.IGNORECASE
+                )
+                if season_match is None:
+                    raise CustomException(ERR_MSG.format(
+                        type=APP_ERROR,
+                        url=collection_url,
+                        reason=f"Couldn't determine the season for episode {episode.get('id', '')}",
+                        solution=f"Debug the {kijk_nl.__name__} service",
+                    ))
+
+                season_number = int(season_match.group(1))
+                season_numbers.add(season_number)
+                season_title = f"Season_{season_number}"
+                collection_check = check_range(
+                    True, season_number, None, is_asc=False
+                )
+                if collection_check is not None:
+                    continue
+
+                episode_indexes[season_number] = (
+                    episode_indexes.get(season_number, 0) + 1
+                )
+                episode_index = episode_indexes[season_number]
+
+                check = check_range(False, season_number, episode_index)
+                if check is not None:
+                    continue
+
+                episode_match = re.search(
+                    r"(?:aflevering|episode)\s*(\d+)",
+                    subtitle,
+                    re.IGNORECASE,
+                )
+                episode_number = (
+                    int(episode_match.group(1))
+                    if episode_match is not None
+                    else episode_index
+                )
+                episode_url = episode.get("url") or (
+                    f"{collection_url}/{episode.get('videoGuid') or episode['id']}"
+                )
+                collection.append(BaseElement(
+                    url=urljoin(kijk_nl.BASE_URL, episode_url),
+                    collection=join(collection_name, season_title),
+                    element=f"Episode_{episode_number}",
+                ))
+
+            clips_endpoint = current_series.get("clipsEndpoint")
+            if clips_endpoint:
+                clip_season = max(season_numbers, default=0) + 1
+                collection_check = check_range(
+                    True, clip_season, None, is_asc=False
+                )
+                if collection_check is None:
+                    clip_title = f"Season_{clip_season}_Clips"
+                    for clip_index, clip in enumerate(
+                        kijk_nl._get_content_api_items(clips_endpoint), start=1
+                    ):
+                        check = check_range(
+                            False, clip_season, clip_index
+                        )
+                        if check is not None:
+                            continue
+
+                        title = get_valid_filename(
+                            clip.get("title")
+                            or clip.get("subtitle")
+                            or clip.get("videoGuid")
+                            or clip.get("id")
+                        )
+                        clip_url = clip.get("url") or (
+                            f"{collection_url}/{clip.get('videoGuid') or clip['id']}"
+                        )
+                        collection.append(BaseElement(
+                            url=urljoin(kijk_nl.BASE_URL, clip_url),
+                            collection=join(collection_name, clip_title),
+                            element=f"Episode_{clip_index}_{title}",
+                        ))
+
+            return collection
+
+        response = (
+            json.loads(re.findall(
+                r'type="application/json"[^<>]*>({.*?})</script>',
+                page_html,
+            )[0])
+            .get("props", {})
+            .get("pageProps", {})
+            .get("formatDataInitial", {})
+            .get("format", {})
+        )
 
         if slug != response.get("slug", ""):
             return []
         collection_name = get_valid_filename(response.get("title", slug))
-        collection_name = join(join(
-            str(builtins.CONFIG["DOWNLOAD_COMMANDS"]["OUTPUT_MEDIA_PATH"]),
-            kijk_nl.__name__
-        ), collection_name)
+        collection_name = join(
+            join(
+                str(builtins.CONFIG["DOWNLOAD_COMMANDS"]["OUTPUT_MEDIA_PATH"]),
+                kijk_nl.__name__,
+            ),
+            collection_name,
+        )
 
         seasons = []
         for s1 in ["seasonList", "seriesTvSeasons"]:
@@ -249,15 +493,20 @@ class kijk_nl(BaseService):
 
                 season_number = s3.get("seasonNumber", 0)
                 season_title = s3["guid"]
-                for st in ["title", 'label', 'ariaLabel']:
+                for st in ["title", "label", "ariaLabel"]:
                     if s3.get(st, "") not in [None, ""]:
                         season_title = s3[st]
                         break
 
-                season_title = get_valid_filename(f'Season_{season_number}_{season_title}')
+                season_title = get_valid_filename(
+                    f"Season_{season_number}_{season_title}"
+                )
                 seasons.append((
-                    season_id, season_number, season_title,
-                    "tvSeasonId", "EPISODE"
+                    season_id,
+                    season_number,
+                    season_title,
+                    "tvSeasonId",
+                    "EPISODE",
                 ))
             break
 
@@ -266,9 +515,11 @@ class kijk_nl(BaseService):
         if len(seasons) > 0:
             season_index = seasons[-1][1]
         seasons.append((
-            response["id"], season_index + 1,
-            f'Season_{season_index + 1}_Clips',
-            'seriesId', 'CLIP'
+            response["id"],
+            season_index + 1,
+            f"Season_{season_index + 1}_Clips",
+            "seriesId",
+            "CLIP",
         ))
 
         content_query = """
@@ -284,7 +535,13 @@ class kijk_nl(BaseService):
         """
 
         collection = []
-        for season_id, season_number, season_title, id_type, program_type in seasons:
+        for (
+            season_id,
+            season_number,
+            season_title,
+            id_type,
+            program_type,
+        ) in seasons:
             check = check_range(True, season_number, None)
             if check is True:
                 continue
@@ -295,24 +552,26 @@ class kijk_nl(BaseService):
             episode_index = 0
 
             while True:
-                request_params = {
-                    'query': content_query,
-                    'operationName': 'programs',
-                    'variables': {
-                        "programTypes": program_type,
-                        "skip": skip,
-                        "limit": kijk_nl.PAGE_SIZE,
-                        id_type: season_id
-                    }
+                variables = {
+                    "programTypes": program_type,
+                    "skip": skip,
+                    "limit": kijk_nl.PAGE_SIZE,
+                    id_type: season_id,
                 }
                 if program_type == "CLIP":
-                    request_params["variables"]["sort"] = 'PUBLICATIONDATETIME'
-                request_params["variables"] = json.dumps(request_params["variables"])
+                    variables["sort"] = "PUBLICATIONDATETIME"
 
-                response = json.loads(requests.get(
-                    kijk_nl.GRAPHQL_URL, params=request_params
-                ).content.decode())["data"]["programs"].get("items", [])
+                request_payload = {
+                    "query": content_query,
+                    "operationName": "programs",
+                    "variables": variables,
+                }
+                resp = requests.post(
+                    kijk_nl.GRAPHQL_URL, headers=kijk_nl.HEADERS, json=request_payload
+                )
+                resp.raise_for_status()
 
+                response = resp.json()["data"]["programs"].get("items", [])
                 if len(response) == 0:
                     break
                 skip += kijk_nl.PAGE_SIZE
@@ -326,7 +585,7 @@ class kijk_nl(BaseService):
                         return collection
 
                     episode_title = episode["guid"]
-                    for et in ["title", 'slug']:
+                    for et in ["title", "slug"]:
                         if episode.get(et, "") not in [None, ""]:
                             episode_title = episode[et]
                             break
@@ -335,9 +594,7 @@ class kijk_nl(BaseService):
                     collection.append(BaseElement(
                         url=collection_url + "/" + episode["guid"],
                         collection=join(collection_name, season_title),
-                        element=f"Episode_{episode_index}"
-                                f"_"
-                                f"{episode_title}"
+                        element=f"Episode_{episode_index}_{episode_title}",
                     ))
 
         return collection

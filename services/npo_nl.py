@@ -3,12 +3,13 @@ import json
 import re
 import time
 from os.path import join
+from urllib.parse import urlparse
 
 import browser_cookie3
 import requests
 from bs4 import BeautifulSoup
 
-from utils.constants.macros import ERR_MSG, USER_ERROR
+from utils.constants.macros import APP_ERROR, ERR_MSG, USER_ERROR
 from utils.main_service import main_service
 from utils.structs import BaseElement, BaseService, CustomException
 from utils.tools.args import check_range
@@ -35,8 +36,6 @@ class npo_nl(BaseService):
     BASE_URL = 'https://npo.nl'
     TOKEN_URL = f'{BASE_URL}/start/api/domain/player-token'
     TICKETS_URL = f'{BASE_URL}/npo3/video_tickets'
-    LICENSE_URL = 'https://npo-drm-gateway.samgcloud.nepworldwide.nl/authentication'
-
     LOGIN_COOKIES = None
     LICENSE_RETRIES = 3
 
@@ -80,19 +79,27 @@ class npo_nl(BaseService):
 
     @staticmethod
     def get_keys(challenge, additional):
+        license_url = additional.get("license_url")
+        if not isinstance(license_url, str) or not license_url:
+            raise CustomException(ERR_MSG.format(
+                type=APP_ERROR,
+                url=additional.get("URL", npo_nl.__name__),
+                reason="NPO did not provide a DRM license URL",
+                solution="Retry later or update the NPO service"
+            ))
+
         licence = None
         for i in range(1, npo_nl.LICENSE_RETRIES + 1):
             try:
                 licence = requests.post(
-                    npo_nl.LICENSE_URL,
-                    params={'custom_data': additional["custom_data"]},
+                    license_url,
                     data=challenge
                 )
                 licence.raise_for_status()
                 break
-            except Exception as e:
+            except requests.HTTPError as e:
                 response = e.response
-                if response.status_code == 500:
+                if response is not None and response.status_code == 500:
                     if i < npo_nl.LICENSE_RETRIES:
                         time.sleep(1)
                         continue
@@ -103,7 +110,7 @@ class npo_nl(BaseService):
                         reason='You requested too much content recently',
                         solution="Wait 1 minute"
                     ))
-                raise e
+                raise
 
         return licence.content
 
@@ -127,6 +134,45 @@ class npo_nl(BaseService):
                     if opening_brackets == 0:
                         json_object = json.loads(source_text[start_index:char_index + 1])
                         return json_object
+
+        flight_chunks = re.findall(
+            r'self\.__next_f\.push\(\[1,("(?:\\.|[^"\\])*")\]\)',
+            source_text
+        )
+        if not flight_chunks:
+            return None
+
+        flight_data = "".join(json.loads(chunk) for chunk in flight_chunks)
+
+        def find_query_state(value):
+            if isinstance(value, dict):
+                state = value.get("state")
+                if isinstance(state, dict) and isinstance(state.get("queries"), list):
+                    return state
+                for child in value.values():
+                    state = find_query_state(child)
+                    if state is not None:
+                        return state
+            elif isinstance(value, list):
+                for child in value:
+                    state = find_query_state(child)
+                    if state is not None:
+                        return state
+            return None
+
+        for line in flight_data.splitlines():
+            row_id, separator, row_data = line.partition(":")
+            if not separator or re.fullmatch(r"[0-9a-f]+", row_id) is None:
+                continue
+
+            try:
+                row = json.loads(row_data)
+            except json.JSONDecodeError:
+                continue
+
+            state = find_query_state(row)
+            if state is not None:
+                return {"props": {"pageProps": {"state": state}}}
         return None
 
     @staticmethod
@@ -189,11 +235,15 @@ class npo_nl(BaseService):
                     response = response[k]
                     break
 
+            url_path = urlparse(source_element.url).path.rstrip("/")
+            path_parts = url_path.split("/")
             slug = None
-            if "/afspelen" in source_element.url:
-                slug = source_element.url.split("/afspelen")[0].split("/")[-1]
-            elif "/video/" in source_element.url:
-                slug = source_element.url.split("/video")[1].split("/")[-1]
+            if len(path_parts) > 1 and path_parts[-2] == "afspelen":
+                slug = path_parts[-1]
+            elif len(path_parts) > 1 and path_parts[-1] == "afspelen":
+                slug = path_parts[-2]
+            elif "/video/" in url_path:
+                slug = path_parts[-1]
 
             for query in response["queries"]:
                 data = query["state"]["data"]
@@ -274,6 +324,10 @@ class npo_nl(BaseService):
                 npo_nl.__name__
             )
         additional = {"URL": source_element.url}
+        drm_data = response["stream"].get("drm")
+        license_url = drm_data.get("licenseUrl") if isinstance(drm_data, dict) else None
+        if isinstance(license_url, str) and license_url:
+            additional["license_url"] = license_url
 
         subtitles = []
         index = 0
@@ -316,7 +370,11 @@ class npo_nl(BaseService):
             ))
 
         if pssh_value is not None:
-            additional["custom_data"] = response["stream"]["drmToken"]
+            custom_data = response["stream"].get("drmToken")
+            if custom_data is None and isinstance(drm_data, dict):
+                custom_data = drm_data.get("token")
+            if custom_data is not None:
+                additional["custom_data"] = custom_data
         # if builtins.CONFIG.get("BASIC", False) is True:
         #    manifest = re.sub(r'/eyJ[^/]*/', '/<TOKEN_TIED_TO_IP>/', manifest)
         return manifest, pssh_value, additional
